@@ -1,0 +1,115 @@
+name: Release
+
+# Builds a tagged version of the app from its private source and publishes it here, where the
+# app looks for updates. Started by scripts/release.sh in the source repository, or by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag in the source repository, e.g. v1.2.3
+        required: true
+      notes:
+        description: Release notes (a line "rollout: 25" offers it to 25% of installs)
+        required: false
+
+concurrency:
+  group: release-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish ${{ github.event.inputs.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ github.event.inputs.tag }}
+      NOTES: ${{ github.event.inputs.notes }}
+      SOURCE_REPOSITORY: gwokudasam/txwallet-android
+    steps:
+      - name: Read the version from the tag
+        id: version
+        run: |
+          if ! [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::tag must look like v1.2.3 (got '$TAG')"
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"; MINOR="${BASH_REMATCH[2]}"; PATCH="${BASH_REMATCH[3]}"
+          # The app maps a tag to this same number to decide what is newer; 99 marks a full release.
+          CODE=$(( 10#$MAJOR * 1000000 + 10#$MINOR * 10000 + 10#$PATCH * 100 + 99 ))
+          echo "name=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "Version [${TAG#v}] code [$CODE]"
+
+      - name: Refuse a version that is already published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$TAG is already published"
+            exit 1
+          fi
+
+      - name: Check out the source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ github.event.inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+
+      - name: Test and build
+        env:
+          SDPAY_VERSION_NAME: ${{ steps.version.outputs.name }}
+          SDPAY_VERSION_CODE: ${{ steps.version.outputs.code }}
+          SDPAY_RELEASES_URL: ${{ github.api_url }}/repos/${{ github.repository }}/releases
+          SDPAY_KEYSTORE: ${{ runner.temp }}/release.jks
+          SDPAY_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SDPAY_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SDPAY_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        # Quiet on purpose: this log is public and the source is not.
+        run: ./gradlew --quiet --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Check the build carries the version and the release signature
+        env:
+          EXPECTED_CODE: ${{ steps.version.outputs.code }}
+          EXPECTED_SIGNER: ${{ vars.SIGNER_SHA256 }}
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          CODE=$("$TOOLS/aapt2" dump badging "$APK" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)
+          SIGNER=$("$TOOLS/apksigner" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          echo "Built code [$CODE] signed by [$SIGNER]"
+          [ "$CODE" = "$EXPECTED_CODE" ] || { echo "::error::version code is [$CODE], expected [$EXPECTED_CODE]"; exit 1; }
+          [ "$SIGNER" = "$EXPECTED_SIGNER" ] || { echo "::error::not signed with the release key"; exit 1; }
+          cp "$APK" "$RUNNER_TEMP/SDPay-${TAG#v}.apk"
+
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s\n' "${NOTES:-SDPay ${TAG#v}}" > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SDPay ${TAG#v}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest \
+            "$RUNNER_TEMP/SDPay-${TAG#v}.apk"
