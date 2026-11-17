@@ -9,7 +9,7 @@ on:
         description: Version tag in the source repository, e.g. v1.2.3
         required: true
       notes:
-        description: Release notes (a line "rollout: 25" offers it to 25% of installs)
+        description: 'Release notes (a line "rollout: 25" offers it to 25% of installs)'
         required: false
 
 concurrency:
@@ -82,18 +82,22 @@ jobs:
           SDPAY_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           SDPAY_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         # Quiet on purpose: this log is public and the source is not.
-        run: ./gradlew --quiet --no-daemon :app:testDebugUnitTest :app:assembleDebug
+        run: ./gradlew --quiet --no-daemon :app:testReleaseUnitTest :app:assembleRelease
 
-      - name: Check the build carries the version and the release signature
+      - name: Check the build is not debuggable and carries the version and the release signature
         env:
           EXPECTED_CODE: ${{ steps.version.outputs.code }}
           EXPECTED_SIGNER: ${{ vars.SIGNER_SHA256 }}
         run: |
-          APK=app/build/outputs/apk/debug/app-debug.apk
+          APK=app/build/outputs/apk/release/app-release.apk
           TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           CODE=$("$TOOLS/aapt2" dump badging "$APK" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)
           SIGNER=$("$TOOLS/apksigner" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
           echo "Built code [$CODE] signed by [$SIGNER]"
+          if "$TOOLS/aapt2" dump badging "$APK" | grep -q 'application-debuggable'; then
+            echo "::error::the build is debuggable and must not be published"
+            exit 1
+          fi
           [ "$CODE" = "$EXPECTED_CODE" ] || { echo "::error::version code is [$CODE], expected [$EXPECTED_CODE]"; exit 1; }
           [ "$SIGNER" = "$EXPECTED_SIGNER" ] || { echo "::error::not signed with the release key"; exit 1; }
           cp "$APK" "$RUNNER_TEMP/SDPay-${TAG#v}.apk"
