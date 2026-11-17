@@ -95,7 +95,8 @@ jobs:
           echo "Build tools [$TOOLS]"
           CODE=$("$TOOLS/aapt2" dump badging "$APK" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)
           CERTS=$("$TOOLS/apksigner" verify --print-certs "$APK" 2>&1) || { echo "::error::the signature could not be read"; echo "$CERTS" | head -20; exit 1; }
-          SIGNER=$(echo "$CERTS" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1)
+          SIGNER=$(echo "$CERTS" | sed -n 's/^.*[Ss]igner.* certificate SHA-256 digest: //p' | sort -u)
+          # Older tools say "Signer #1", newer ones "V2 Signer": either way there must be exactly one key.
           [ -n "$SIGNER" ] || echo "$CERTS" | head -20
           echo "Built code [$CODE] signed by [$SIGNER]"
           if "$TOOLS/aapt2" dump badging "$APK" | grep -q 'application-debuggable'; then
